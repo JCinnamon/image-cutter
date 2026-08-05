@@ -433,6 +433,8 @@ kbd{font-family:var(--mono);font-size:.7rem;background:var(--bg-page);border:1px
           <span class="sub">Trim the transparent margin around the region</span></label>
         <label class="chk"><input type="checkbox" id="opt-largest"> Keep only the largest connected part
           <span class="sub">Discards stray specks away from the main region</span></label>
+        <label class="chk"><input type="checkbox" id="opt-exif" checked> Preserve GPS / EXIF
+          <span class="sub">Copy the source photo's EXIF (GPS, capture date, camera) into exported PNGs and the measurements CSV</span></label>
         <div style="margin-top:.6rem">
           <label class="fld" for="opt-feather">Edge softening (<span id="feather-lab">0</span> px)</label>
           <input type="range" id="opt-feather" min="0" max="6" step="1" value="0">
@@ -745,6 +747,91 @@ function canvasToBlob(cv, type = 'image/png', q) {
   return new Promise(res => cv.toBlob(res, type, q));
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   EXIF / GPS PASSTHROUGH
+   Browser canvas export drops all metadata, so the source photo's EXIF is
+   read once at load and re-attached on export: written into each PNG as an
+   eXIf chunk (PNG 1.5) and added as columns to the measurements CSV. All
+   self-contained — no library, works offline.
+   ══════════════════════════════════════════════════════════════════════ */
+function extractExifFromJpeg(buf) {
+  const dv = new DataView(buf);
+  if (dv.getUint16(0) !== 0xFFD8) return null;               // not a JPEG
+  let off = 2;
+  while (off + 4 <= dv.byteLength) {
+    const marker = dv.getUint16(off);
+    if ((marker & 0xFF00) !== 0xFF00) break;
+    if (marker === 0xFFDA) break;                            // start of scan
+    const size = dv.getUint16(off + 2);
+    if (marker === 0xFFE1 && off + 10 <= dv.byteLength &&
+        dv.getUint32(off + 4) === 0x45786966 && dv.getUint16(off + 8) === 0x0000) {
+      const tiff = new Uint8Array(buf.slice(off + 10, off + 2 + size)); // raw TIFF (II/MM …)
+      let fields = {};
+      try { fields = parseTiffFields(tiff); } catch (e) { fields = {}; }
+      return { tiff, fields };
+    }
+    off += 2 + size;
+  }
+  return null;
+}
+
+function parseTiffFields(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const le = dv.getUint16(0) === 0x4949;                    // 'II' little-endian
+  const g16 = o => dv.getUint16(o, le), g32 = o => dv.getUint32(o, le);
+  const SZ = { 1:1, 2:1, 3:2, 4:4, 5:8, 7:1, 9:4, 10:8 };
+  const out = {};
+  const entryVal = e => { const type = g16(e+2), count = g32(e+4);
+    const size = (SZ[type]||1)*count; return { type, count, vOff: size>4 ? g32(e+8) : e+8 }; };
+  const ascii = v => { let s=''; for (let i=0;i<v.count;i++){ const c=dv.getUint8(v.vOff+i); if(!c)break; s+=String.fromCharCode(c);} return s.trim(); };
+  const rat = o => g32(o+4) ? g32(o)/g32(o+4) : 0;
+  const readIFD = (off, tags) => { const n=g16(off), r={}; for(let i=0;i<n;i++){ const e=off+2+i*12, t=g16(e); if(tags[t]!==undefined) r[t]=entryVal(e); } return r; };
+  const d0 = readIFD(g32(4), {0x010F:1,0x0110:1,0x0112:1,0x0132:1,0x8769:1,0x8825:1});
+  if (d0[0x010F]) out.make = ascii(d0[0x010F]);
+  if (d0[0x0110]) out.model = ascii(d0[0x0110]);
+  if (d0[0x0112]) out.orientation = g16(d0[0x0112].vOff);
+  if (d0[0x0132]) out.datetime = ascii(d0[0x0132]);
+  if (d0[0x8769]) { const de = readIFD(g32(d0[0x8769].vOff), {0x9003:1}); if (de[0x9003]) out.datetime = ascii(de[0x9003]) || out.datetime; }
+  if (d0[0x8825]) {
+    const dg = readIFD(g32(d0[0x8825].vOff), {1:1,2:1,3:1,4:1,5:1,6:1});
+    const dms = v => rat(v.vOff) + rat(v.vOff+8)/60 + rat(v.vOff+16)/3600;
+    if (dg[2] && dg[4]) {
+      let lat = dms(dg[2]), lon = dms(dg[4]);
+      if (dg[1] && String.fromCharCode(dv.getUint8(dg[1].vOff)) === 'S') lat = -lat;
+      if (dg[3] && String.fromCharCode(dv.getUint8(dg[3].vOff)) === 'W') lon = -lon;
+      out.lat = +lat.toFixed(7); out.lon = +lon.toFixed(7);
+    }
+    if (dg[6]) { let alt = rat(dg[6].vOff); if (dg[5] && dv.getUint8(dg[5].vOff) === 1) alt = -alt; out.alt = +alt.toFixed(2); }
+  }
+  return out;
+}
+
+const _CRC_T = (() => { const t = new Uint32Array(256);
+  for (let n=0;n<256;n++){ let c=n; for (let k=0;k<8;k++) c = c&1 ? 0xEDB88320 ^ (c>>>1) : c>>>1; t[n]=c>>>0; } return t; })();
+function _crc32(b){ let c=0xFFFFFFFF; for (let i=0;i<b.length;i++) c=_CRC_T[(c^b[i])&0xFF]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
+
+function pngInsertExif(png, tiff) {
+  const sig = [137,80,78,71,13,10,26,10];
+  for (let i=0;i<8;i++) if (png[i] !== sig[i]) return png;   // not a PNG, leave it
+  const ihdrLen = (png[8]<<24)|(png[9]<<16)|(png[10]<<8)|png[11];
+  const at = 8 + 4 + 4 + ihdrLen + 4;                        // just after the IHDR chunk
+  const type = [0x65,0x58,0x49,0x66];                        // 'eXIf'
+  const chunk = new Uint8Array(12 + tiff.length);
+  new DataView(chunk.buffer).setUint32(0, tiff.length);
+  chunk.set(type, 4); chunk.set(tiff, 8);
+  const crcIn = new Uint8Array(4 + tiff.length); crcIn.set(type,0); crcIn.set(tiff,4);
+  new DataView(chunk.buffer).setUint32(8 + tiff.length, _crc32(crcIn));
+  const out = new Uint8Array(png.length + chunk.length);
+  out.set(png.subarray(0, at), 0); out.set(chunk, at); out.set(png.subarray(at), at + chunk.length);
+  return out;
+}
+
+async function pngWithExif(blob, exif) {
+  if (!exif || !exif.tiff) return blob;
+  const u8 = new Uint8Array(await blob.arrayBuffer());
+  return new Blob([pngInsertExif(u8, exif.tiff)], { type: 'image/png' });
+}
+
 async function ingest(files) {
   const list = [...files].filter(isImageFile);
   if (!list.length) { setStatus('load-status', 'No image files found in that selection.', 'err'); return; }
@@ -765,11 +852,16 @@ async function ingest(files) {
       const procCv = fitCanvas(bmp, cap);
       bmp.close && bmp.close();
       const procBlob = await canvasToBlob(procCv, 'image/png');
+      let exif = null;
+      if (/jpe?g/i.test(f.type) || /\.jpe?g$/i.test(f.name)) {
+        try { exif = extractExifFromJpeg(await f.arrayBuffer()); } catch (e) { exif = null; }
+      }
       S.images.push({
         id: nextId++, file: f, name: f.name,
         ow, oh, pw: procCv.width, ph: procCv.height,
         purl: URL.createObjectURL(procBlob),
         thumb: thumbCv.toDataURL('image/jpeg', 0.7),
+        exif,
         result: null, include: true
       });
     } catch (e) {
@@ -1790,15 +1882,20 @@ $('btn-inc-none').addEventListener('click', () => { S.images.forEach(i => { if (
 const CSV_HEAD = ['file', 'export_width', 'export_height', 'regions', 'score',
   'mask_area_px', 'mask_percent_of_frame', 'bbox_x0', 'bbox_y0', 'bbox_x1', 'bbox_y1',
   'bbox_width', 'bbox_height', 'centroid_x', 'centroid_y', 'centroid_x_rel', 'centroid_y_rel',
-  'model', 'device'];
+  'model', 'device',
+  'gps_lat', 'gps_lon', 'gps_alt', 'datetime', 'camera_make', 'camera_model', 'orientation'];
 
 function statsRow(im, s, w, h) {
   const bb = s.bbox || [0, 0, 0, 0];
+  const wantExif = $('opt-exif') && $('opt-exif').checked;
+  const e = (wantExif && im.exif && im.exif.fields) ? im.exif.fields : {};
+  const g = v => (v === undefined || v === null) ? '' : v;
   return [im.name, w, h, im.result.n, im.result.score.toFixed(4),
     s.area, pct(s.area, w * h).toFixed(4),
     bb[0], bb[1], bb[2], bb[3], bb[2] - bb[0] + 1, bb[3] - bb[1] + 1,
     s.cx.toFixed(1), s.cy.toFixed(1), (s.cx / w).toFixed(4), (s.cy / h).toFixed(4),
-    S.modelKey ? MODELS[S.modelKey].repo : '', S.device || ''];
+    S.modelKey ? MODELS[S.modelKey].repo : '', S.device || '',
+    g(e.lat), g(e.lon), g(e.alt), g(e.datetime), g(e.make), g(e.model), g(e.orientation)];
 }
 function toCSV(rows) {
   const esc2 = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
@@ -1829,10 +1926,13 @@ async function exportCurrent() {
   const base = `${safeName($('proj').value || 'cutter')}_${safeName(stem(im.name))}`;
   try {
     let stats = null, w = 0, h = 0;
+    const wantExif = $('opt-exif').checked;
     for (const [kind, suffix] of kinds) {
       const r = await renderKind(im, kind, opts);
       stats = stats || r.stats; w = r.w; h = r.h;
-      download(await canvasToBlob(r.cv), `${base}_${suffix}.png`);
+      let blob = await canvasToBlob(r.cv);
+      if (wantExif) blob = await pngWithExif(blob, im.exif);
+      download(blob, `${base}_${suffix}.png`);
     }
     if ($('out-csv').checked) {
       if (!stats) { const r = await renderKind(im, 'mask', opts); stats = r.stats; w = r.w; h = r.h; }
@@ -1864,10 +1964,13 @@ async function exportAll() {
       showProg('export-prog', i / list.length);
       const base = `${safeName($('proj').value || 'cutter')}_${safeName(stem(im.name))}`;
       let stats = null, w = 0, h = 0;
+      const wantExif = $('opt-exif').checked;
       for (const [kind, suffix] of kinds) {
         const r = await renderKind(im, kind, opts);
         stats = stats || r.stats; w = r.w; h = r.h;
-        zip.file(`${base}_${suffix}.png`, await canvasToBlob(r.cv));
+        let blob = await canvasToBlob(r.cv);
+        if (wantExif) blob = await pngWithExif(blob, im.exif);
+        zip.file(`${base}_${suffix}.png`, blob);
       }
       if ($('out-csv').checked) {
         if (!stats) { const r = await renderKind(im, 'mask', opts); stats = r.stats; w = r.w; h = r.h; }
@@ -1882,7 +1985,12 @@ async function exportAll() {
       `Images: ${list.length}\n\n` +
       `Cutout PNGs carry an alpha channel: the selected region is opaque, everything else transparent.\n` +
       `Inverse cutouts are the complement. Binary masks are white on black.\n` +
-      `measurements.csv reports area in pixels, share of frame, bounding box and centroid.\n\n` +
+      `measurements.csv reports area in pixels, share of frame, bounding box and centroid.\n` +
+      (($('opt-exif') && $('opt-exif').checked)
+        ? `GPS/EXIF passthrough is ON: source EXIF is copied into each PNG as an eXIf chunk, and\n` +
+          `gps_lat, gps_lon, gps_alt, datetime, camera and orientation are added to measurements.csv.\n` +
+          `PNG inputs and any images without EXIF simply leave those fields blank.\n`
+        : `GPS/EXIF passthrough is OFF.\n`) + `\n` +
       `Masks are model predictions, not ground truth. Report the model and its error rate as you would any instrument.\n`);
     setStatus('export-status', 'Compressing…');
     download(await zip.generateAsync({ type: 'blob' }),
