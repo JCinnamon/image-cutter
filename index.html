@@ -430,7 +430,10 @@ kbd{font-family:var(--mono);font-size:.7rem;background:var(--bg-page);border:1px
       <div class="col" style="flex:1 1 260px">
         <label class="fld">Options</label>
         <label class="chk"><input type="checkbox" id="opt-crop" checked> Crop to the bounding box
-          <span class="sub">Trim the transparent margin around the region</span></label>
+          <span class="sub">Trim the transparent margin around the region. Uncheck to keep the full source canvas — do this for 360°/wide-angle work, where cropping breaks the fixed relationship between image row and viewing angle.</span></label>
+        <div id="crop-warn" style="display:none;margin:-.35rem 0 .6rem 1.55rem;padding:.45rem .6rem;border-left:3px solid #c98a12;background:#fdf6e7;color:#6b4c05;font-size:.72rem;line-height:1.45;border-radius:0 4px 4px 0">
+          <b>Equirectangular source detected.</b> Cropping to the bounding box means the cut-out no longer spans the frame's full elevation range, and the crop height varies from image to image. Any downstream projection weighting or reprojection is then applied against the wrong axis. Uncheck <i>Crop to the bounding box</i> to keep the full canvas.
+        </div>
         <label class="chk"><input type="checkbox" id="opt-largest"> Keep only the largest connected part
           <span class="sub">Discards stray specks away from the main region</span></label>
         <label class="chk"><input type="checkbox" id="opt-exif" checked> Preserve GPS / EXIF
@@ -911,6 +914,7 @@ async function filesFromDataTransfer(dt) {
 }
 
 function sizeAdvice() {
+  updateCropWarn();
   if (!S.images.length) { $('size-advice').textContent = ''; return; }
   const big = S.images.filter(i => Math.max(i.ow, i.oh) > 4000).length;
   const mp = S.images.reduce((a, i) => a + i.ow * i.oh, 0) / 1e6;
@@ -1771,6 +1775,19 @@ function currentOpts() {
   return { crop: $('opt-crop').checked, largest: $('opt-largest').checked, feather: +$('opt-feather').value };
 }
 
+/* Cropping to the bounding box destroys the fixed row↔angle mapping that 360°
+   projections depend on, and the crop height varies image to image. Warn when the
+   loaded imagery looks equirectangular (2:1) and cropping is still enabled. */
+function looksEquirect() {
+  return S.images.some(i => i.ow && i.oh && Math.abs(i.ow / i.oh - 2) < 0.06);
+}
+function updateCropWarn() {
+  const el = $('crop-warn'), cb = $('opt-crop');
+  if (!el || !cb) return;
+  el.style.display = (cb.checked && S.images.length && looksEquirect()) ? 'block' : 'none';
+}
+$('opt-crop').addEventListener('change', updateCropWarn);
+
 /* ══════════════════════════════════════════════════════════════════════
    REVIEW
    Previews are drawn from the working-resolution mask so the gallery
@@ -1883,19 +1900,26 @@ const CSV_HEAD = ['file', 'export_width', 'export_height', 'regions', 'score',
   'mask_area_px', 'mask_percent_of_frame', 'bbox_x0', 'bbox_y0', 'bbox_x1', 'bbox_y1',
   'bbox_width', 'bbox_height', 'centroid_x', 'centroid_y', 'centroid_x_rel', 'centroid_y_rel',
   'model', 'device',
-  'gps_lat', 'gps_lon', 'gps_alt', 'datetime', 'camera_make', 'camera_model', 'orientation'];
+  'gps_lat', 'gps_lon', 'gps_alt', 'datetime', 'camera_make', 'camera_model', 'orientation',
+  'cutout_width', 'cutout_height', 'cropped_to_bbox'];
 
 function statsRow(im, s, w, h) {
   const bb = s.bbox || [0, 0, 0, 0];
   const wantExif = $('opt-exif') && $('opt-exif').checked;
   const e = (wantExif && im.exif && im.exif.fields) ? im.exif.fields : {};
   const g = v => (v === undefined || v === null) ? '' : v;
+  // export_width/export_height are the SOURCE frame. cutout_width/cutout_height are the
+  // pixel dimensions actually written for the cut-out PNG, which differ when cropping is on.
+  const cropped = !!($('opt-crop') && $('opt-crop').checked) && !!s.bbox;
+  const cutW = cropped ? (bb[2] - bb[0] + 1) : w;
+  const cutH = cropped ? (bb[3] - bb[1] + 1) : h;
   return [im.name, w, h, im.result.n, im.result.score.toFixed(4),
     s.area, pct(s.area, w * h).toFixed(4),
     bb[0], bb[1], bb[2], bb[3], bb[2] - bb[0] + 1, bb[3] - bb[1] + 1,
     s.cx.toFixed(1), s.cy.toFixed(1), (s.cx / w).toFixed(4), (s.cy / h).toFixed(4),
     S.modelKey ? MODELS[S.modelKey].repo : '', S.device || '',
-    g(e.lat), g(e.lon), g(e.alt), g(e.datetime), g(e.make), g(e.model), g(e.orientation)];
+    g(e.lat), g(e.lon), g(e.alt), g(e.datetime), g(e.make), g(e.model), g(e.orientation),
+    cutW, cutH, cropped ? 'yes' : 'no'];
 }
 function toCSV(rows) {
   const esc2 = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
